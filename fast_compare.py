@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
-"""
-Fast MOCVD Recipe Comparator (Plotly, event-based)
-- Streamlit/Jupyter 공용
-- 선택 변수만 계산, 변화 지점만 수집 → 매우 빠름
-"""
+# Fast MOCVD Recipe Comparator (Plotly, event-based)
 
-import re, hashlib
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 from functools import lru_cache
@@ -13,9 +9,6 @@ from functools import lru_cache
 import plotly.graph_objects as go
 import pandas as pd
 
-# --------------------------
-# Regex & helpers
-# --------------------------
 DURATION_RE = re.compile(r'^(?P<h>\d{1,2}):(?P<m>\d{2}):(?P<s>\d{2})\s*')
 COMMENT_RE  = re.compile(r'^\s*"(?P<comment>[^"]*)"\s*,?')
 ACTION_RE   = re.compile(r'\s*(?P<var>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*(?P<op>=|to)\s*(?P<val>[^,;]+)\s*(?:,|;)?')
@@ -40,9 +33,6 @@ def boolish(v: Any) -> Optional[int]:
         if lv in C_FALSE: return 0
     return None
 
-# --------------------------
-# Loop expander
-# --------------------------
 def expand_loops(text: str) -> str:
     loop_pat = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
     def _expand(s: str) -> str:
@@ -64,9 +54,6 @@ def expand_loops(text: str) -> str:
         return ''.join(out)
     return _expand(text)
 
-# --------------------------
-# Data classes
-# --------------------------
 @dataclass
 class Action:
     var: str
@@ -90,9 +77,6 @@ class Step:
 class Recipe:
     steps: List[Step] = field(default_factory=list)
 
-# --------------------------
-# Parser (lenient)
-# --------------------------
 class Parser:
     def __init__(self, tolerate_missing_semicolon: bool = True):
         self.tolerate_missing_semicolon = tolerate_missing_semicolon
@@ -159,9 +143,6 @@ class Parser:
             a.parse_value(); actions.append(a); i = m3.end()
         return Step(dur_s=dur, comment=comment, actions=actions)
 
-# --------------------------
-# Change-point builder (no dt)
-# --------------------------
 def build_change_points(recipe: Recipe, variables: Iterable[str]) -> Tuple[Dict[str, List[Tuple[float, float]]], float]:
     wanted = set(variables)
     state: Dict[str, Any] = {}
@@ -211,22 +192,12 @@ def build_change_points(recipe: Recipe, variables: Iterable[str]) -> Tuple[Dict[
         series_cp[var] = cleaned
     return series_cp, total_T
 
-# --------------------------
-# Cache by content
-# --------------------------
 @lru_cache(maxsize=256)
 def _parse_cached(text: str) -> Recipe:
     parser = Parser(tolerate_missing_semicolon=True)
     return parser.parse(text)
 
-# --------------------------
-# Public API (Streamlit/Jupyter)
-# --------------------------
 def compare_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=True) -> Dict[str, "go.Figure"]:
-    """
-    files: [(name, text), ...]
-    returns: {var: plotly Figure}
-    """
     runs = []
     for name, txt in files:
         recipe = _parse_cached(txt)
