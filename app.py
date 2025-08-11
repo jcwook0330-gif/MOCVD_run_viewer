@@ -2,7 +2,7 @@
 # MOCVD Recipe Visualizer (Streamlit)
 # - 단일 레시피: 루프 전개 + 루프 요약 표 + 루프 패턴 뷰 + 상세 로그 + 플롯
 # - 배치 비교: 여러 파일 업로드 → 변수별 run 비교(Plotly, 이벤트 기반 빠른 렌더)
-# - 추가: Peak ReactorTemp vs Pre-loop ReactorPress 산점도
+# - 산점도: Peak ReactorTemp (x) vs Pre-Stabilization(없으면 Pre-loop) ReactorPress (y)
 # - 주석(#/ // / 구분선) 무시, 마지막 세미콜론 누락 허용, '='(즉시), 'to'(선형 램프)
 
 import re
@@ -14,10 +14,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# 배치 비교용 빠른 엔진 (Plotly) + 새 산점도 피처계산
+# 배치 비교용 빠른 엔진 (Plotly) + 산점도 피처
 from fast_compare import (
-    compare_memory, tidy_memory,
-    scatter_features_memory  # (new) DF + Figure 산출
+    compare_memory, tidy_memory, scatter_features_memory
 )
 
 # --------------------------
@@ -85,7 +84,7 @@ def expand_loops_with_blocks(text: str):
 @dataclass
 class Action:
     var: str
-    op: str
+    op: str      # '=' or 'to'
     raw_value: str
     value: Any = None
     def parse_value(self):
@@ -211,7 +210,6 @@ class Timeline:
             ramps: List[Tuple[str, float, float]] = []
             jumps: List[Tuple[str, Any]] = []
 
-            # 점프('='), 램프('to')
             for a in st.actions:
                 if a.op == '=':
                     val = a.value
@@ -229,17 +227,14 @@ class Timeline:
                     else:
                         jumps.append((a.var, val))
 
-            # 점프 먼저 반영
             for var, val in jumps:
                 state[var] = val
 
-            # 시리즈 키 보장
             need_vars = set(state.keys()) | {v for (v, _, _) in ramps}
             for var in need_vars:
                 if var not in series:
                     series[var] = [None] * len(times)
 
-            # 구간 채우기
             for idx, t in enumerate(times):
                 if t < t0 or t > t1:
                     continue
@@ -254,7 +249,6 @@ class Timeline:
                     val = state.get(var, series[var][idx - 1] if idx > 0 else None)
                     series[var][idx] = val
 
-        # forward-fill
         for var, arr in series.items():
             last = None
             for i, v in enumerate(arr):
@@ -326,9 +320,7 @@ with st.expander("옵션", expanded=True):
     absolute = st.checkbox("타임스탬프를 절대 시간으로 해석", value=False, key="abs")
     mode = st.radio("단일 파일 플롯 모드", ["겹쳐 그리기(한 그림)", "변수별 분리"], horizontal=True, key="mode")
 
-# --------------------------
-# A) 단일 레시피
-# --------------------------
+# ---- A) 단일 레시피
 uploaded = st.file_uploader("단일 레시피 업로드 (.txt)", type=["txt"])
 use_demo = st.checkbox("내장 데모 사용", value=False)
 
@@ -399,9 +391,7 @@ if uploaded or use_demo:
             if mode.startswith("겹쳐"): plot_overlay(times, series, picked)
             else:                      plot_separate(times, series, picked)
 
-# --------------------------
-# B) 배치 비교 (여러 레시피 업로드)
-# --------------------------
+# ---- B) 배치 비교
 st.markdown("---")
 st.header("🧪 배치 비교 (여러 레시피 업로드)")
 
@@ -433,8 +423,8 @@ if files:
         st.download_button("CSV 다운로드(배치 tidy)", data=df_tidy.to_csv(index=False).encode("utf-8-sig"),
                            file_name="batch_tidy.csv", mime="text/csv")
 
-    # -------- NEW: 산점도 (Peak Temp vs Pre-loop Press) --------
-    st.subheader("📍 분산도: Peak ReactorTemp  vs  Pre-loop ReactorPress")
+    # 산점도: Peak T vs Pre-Ref P  (라벨=run number)
+    st.subheader("📍 분산도: Peak ReactorTemp  vs  Pre-Ref ReactorPress (라벨=run#)")
     df_feat, fig_scatter = scatter_features_memory(file_tuples)
     st.plotly_chart(fig_scatter, use_container_width=True)
     st.dataframe(df_feat, use_container_width=True)
