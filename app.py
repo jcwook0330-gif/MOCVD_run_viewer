@@ -14,7 +14,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# 배치 비교용 빠른 엔진 (Plotly) + 산점도 피처
+# 배치 비교 + 산점도 피처
 from fast_compare import (
     compare_memory, tidy_memory, scatter_features_memory
 )
