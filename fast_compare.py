@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Fast MOCVD Recipe Comparator (Plotly, event-based)
 # + 산점도 피처: Peak ReactorTemp, Pre-Stabilization(없으면 Pre-loop) ReactorPress
+# + 산점도 라벨: 파일명 맨 앞 숫자(run number)만 표시
 
 import re
 from dataclasses import dataclass, field
@@ -14,10 +15,17 @@ DURATION_RE = re.compile(r'^(?P<h>\d{1,2}):(?P<m>\d{2}):(?P<s>\d{2})\s*')
 COMMENT_RE  = re.compile(r'^\s*"(?P<comment>[^"]*)"\s*,?')
 ACTION_RE   = re.compile(r'\s*(?P<var>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*(?P<op>=|to)\s*(?P<val>[^,;]+)\s*(?:,|;)?')
 
-# loop 키워드(텍스트 레벨에서 탐지용)
+# 키워드 탐지
 LOOP_KW_RE  = re.compile(r'\bloop\s+\d+\s*\{', re.IGNORECASE)
-# stabilization 키워드(코멘트에 다양하게 등장할 수 있음)
-STAB_TXT_RE = re.compile(r'stabil', re.IGNORECASE)  # Stabilization/Stabilisation/Stabilize 등 포괄
+STAB_TXT_RE = re.compile(r'stabil', re.IGNORECASE)  # Stabilization/ize/isation 등 포괄
+
+# 파일명 맨 앞 숫자(run number) 추출
+RUN_NO_HEAD = re.compile(r'^\s*(\d+)')
+def extract_run_no(name: str) -> str:
+    m = RUN_NO_HEAD.match(name)
+    if m: return m.group(1)
+    m2 = re.search(r'(\d+)', name)
+    return m2.group(1) if m2 else name
 
 C_TRUE  = {'on','open','enable','enabled','start','true','high'}
 C_FALSE = {'off','close','closed','disable','disabled','stop','false','low'}
@@ -40,7 +48,7 @@ def boolish(v: Any) -> Optional[int]:
     return None
 
 # --------------------------
-# Loop expander (문장 수준 전개)
+# Loop expander
 # --------------------------
 def expand_loops(text: str) -> str:
     loop_pat = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
@@ -216,7 +224,7 @@ def _parse_cached(text: str) -> Recipe:
     return parser.parse(text)
 
 # --------------------------
-# Public: batch compare (기존)
+# Batch compare (기존)
 # --------------------------
 def compare_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=True) -> Dict[str, "go.Figure"]:
     runs = []
@@ -264,9 +272,7 @@ def tidy_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=
     return pd.DataFrame(rows)
 
 # --------------------------
-# NEW: 산점도용 피처
-#   x = Peak ReactorTemp (전체)
-#   y = Pre-stabilization ReactorPress  (없으면 Pre-loop, 둘 다 없으면 None)
+# NEW: 산점도용 피처 (Peak T, Pre-Ref P: Stabilization≻Loop)
 # --------------------------
 def _preclean_text(text: str) -> str:
     out_lines = []
@@ -300,7 +306,6 @@ def _peak_temp_from_text(text: str) -> Optional[float]:
     return max(vals) if vals else None
 
 def _press_before_time(recipe: Recipe, t_cut: float) -> Optional[float]:
-    """t_cut 직전의 ReactorPress 값을 반환."""
     series_cp, _ = build_change_points(recipe, ["ReactorPress"])
     pts = series_cp.get("ReactorPress", [])
     if not pts: return None
@@ -313,7 +318,6 @@ def _press_before_time(recipe: Recipe, t_cut: float) -> Optional[float]:
     return prev_val
 
 def _preloop_press_from_text(text: str) -> Optional[float]:
-    """fallback: 첫 loop 키워드 이전 텍스트로 파싱하여 마지막 압력."""
     cleaned = _preclean_text(text)
     m = LOOP_KW_RE.search(cleaned)
     pre = cleaned[:m.start()] if m else cleaned
@@ -324,14 +328,12 @@ def _preloop_press_from_text(text: str) -> Optional[float]:
     return pts[-1][1]
 
 def _pre_stabilization_or_loop_press(text: str) -> Optional[float]:
-    """우선순위: Stabilization 직전 → Loop 직전 → None"""
     recipe = _parse_cached(text)
     t_stab = _first_stabilization_time(recipe)
     if t_stab is not None:
         val = _press_before_time(recipe, t_stab)
         if val is not None:
             return val
-    # fallback
     return _preloop_press_from_text(text)
 
 def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame, "go.Figure"]:
@@ -339,20 +341,28 @@ def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame,
     for name, txt in files:
         x = _peak_temp_from_text(txt)
         y = _pre_stabilization_or_loop_press(txt)
-        rows.append({"run": name, "ReactorTemp_peak": x, "ReactorPress_preRef": y})
+        rows.append({
+            "run": name,
+            "run_no": extract_run_no(name),    # 라벨용 run number
+            "ReactorTemp_peak": x,
+            "ReactorPress_preRef": y
+        })
     df = pd.DataFrame(rows)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df["ReactorTemp_peak"], y=df["ReactorPress_preRef"],
-        mode="markers+text", text=df["run"], textposition="top center",
-        name="runs"
+        x=df["ReactorTemp_peak"],
+        y=df["ReactorPress_preRef"],
+        mode="markers+text",
+        text=df["run_no"],                  # 숫자 라벨만
+        textposition="top center",
+        name="runs",
+        hovertemplate="run=%{text}<br>PeakT=%{x}<br>PreRefP=%{y}<extra></extra>"
     ))
     fig.update_layout(
-        title="Peak ReactorTemp  vs  Pre-Ref ReactorPress (Stabilization≻Loop)",
+        title="Peak ReactorTemp  vs  Pre-Ref ReactorPress (label: run#)",
         xaxis_title="Peak ReactorTemp",
         yaxis_title="Pre-Ref ReactorPress",
         template="plotly_white"
     )
     return df, fig
-
