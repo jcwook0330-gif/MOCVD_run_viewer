@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # MOCVD Recipe Visualizer (Streamlit)
 # - 단일 레시피: 루프 전개 + 루프 요약 표 + 루프 패턴 뷰 + 상세 로그 + 플롯
-# - 배치 비교: 여러 파일 업로드 → 선택 변수에 대해 run 간 비교(Plotly, 이벤트 기반 빠른 렌더)
+# - 배치 비교: 여러 파일 업로드 → 변수별 run 비교(Plotly, 이벤트 기반 빠른 렌더)
 # - 주석(#/ // / 구분선) 무시, 마지막 세미콜론 누락 허용, '='(즉시), 'to'(선형 램프)
 
 import re
@@ -13,7 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# 배치 비교용 빠른 엔진 (Plotly) — 별도 모듈
+# 배치 비교용 빠른 엔진 (Plotly)
 from fast_compare import compare_memory, tidy_memory
 
 # --------------------------
@@ -93,7 +93,7 @@ class Action:
 
 @dataclass
 class Step:
-    time_s: int              # duration(기본) 또는 절대 endpoint(옵션)
+    time_s: int
     comment: Optional[str]
     actions: List[Action] = field(default_factory=list)
 
@@ -113,7 +113,6 @@ class Parser:
         cleaned = self._preclean(text)
         expanded, loop_blocks = expand_loops_with_blocks(cleaned)
         self.loop_blocks = loop_blocks or []
-
         blocks = self._gather(expanded)
         steps: List[Step] = []
         for b in blocks:
@@ -174,67 +173,91 @@ class Parser:
         return Step(time_s=t, comment=comment, actions=actions)
 
 # --------------------------
-# 타임라인 생성 (단일 레시피용: dt 샘플링)
+# 타임라인 생성 (단일 레시피용)
 # --------------------------
 class Timeline:
     def __init__(self, dt:int=1, absolute:bool=False):
-        if dt<=0: raise ValueError("dt must be >=1")
-        self.dt=dt; self.absolute=absolute
+        if dt <= 0:
+            raise ValueError("dt must be >= 1")
+        self.dt = dt
+        self.absolute = absolute
 
-    def build(self, recipe:Recipe) -> Tuple[List[int], Dict[str,List[Any]], List[Tuple[int,int,Step]]]:
-        windows=[]; cursor=0
+    def build(self, recipe: Recipe) -> Tuple[List[int], Dict[str, List[Any]], List[Tuple[int, int, Step]]]:
+        windows: List[Tuple[int, int, Step]] = []
+        cursor = 0
         for st in recipe.steps:
             if self.absolute:
-                t0 = cursor; t1 = st.time_s
-                if t1 < t0: raise ValueError("Absolute times must be non-decreasing.")
+                t0 = cursor
+                t1 = st.time_s
+                if t1 < t0:
+                    raise ValueError("Absolute times must be non-decreasing.")
                 cursor = t1
             else:
-                t0 = cursor; t1 = cursor + st.time_s; cursor = t1
-            windows.append((t0,t1,st))
+                t0 = cursor
+                t1 = cursor + st.time_s
+                cursor = t1
+            windows.append((t0, t1, st))
+
         total_T = windows[-1][1] if windows else 0
-        times = list(range(0, total_T+1, self.dt))
-        series: Dict[str,List[Any]] = {}
-        state: Dict[str,Any] = {}
+        times = list(range(0, total_T + 1, self.dt))
+        series: Dict[str, List[Any]] = {}
+        state: Dict[str, Any] = {}
 
-        for (t0,t1,st) in windows:
-            ramps: List[Tuple[str,float,float]] = []
-            jumps: List[Tuple[str,Any]] = []
+        for (t0, t1, st) in windows:
+            ramps: List[Tuple[str, float, float]] = []
+            jumps: List[Tuple[str, Any]] = []
+
+            # 액션 수집: 점프('='), 램프('to')
             for a in st.actions:
-                if a.op=='=':
-                    jumps.append((a.var,a.value))
-                    elif a.op == 'to':
-                        prev = state.get(a.var)
-                        val  = a.value
-                          b = to_boolish(val)           # 'open'→1, 'close'→0
-                        val = b if b is not None else val
+                if a.op == '=':
+                    val = a.value
+                    b = to_boolish(val)     # 'open'/'close' 등 처리
+                    val = b if b is not None else val
+                    jumps.append((a.var, val))
 
+                elif a.op == 'to':
+                    prev = state.get(a.var)
+                    val = a.value
+                    b = to_boolish(val)
+                    val = b if b is not None else val
                     if isinstance(prev, (int, float)) and isinstance(val, (int, float)):
                         ramps.append((a.var, float(prev), float(val)))
                     else:
+                        # 숫자 램프 불가 → 구간 끝에서 점프
                         jumps.append((a.var, val))
 
-            for var,val in jumps: state[var]=val
-            for var in set(list(state.keys()) + [r[0] for r in ramps]):
-                if var not in series: series[var] = [None]*len(times)
-            for idx,t in enumerate(times):
-                if t < t0 or t > t1: continue
-                for var,v0,v1 in ramps:
-                    if t1==t0: vt=v1
+            # 점프 먼저 반영
+            for var, val in jumps:
+                state[var] = val
+
+            # 시리즈 키 보장
+            need_vars = set(state.keys()) | {v for (v, _, _) in ramps}
+            for var in need_vars:
+                if var not in series:
+                    series[var] = [None] * len(times)
+
+            # 구간 채우기
+            for idx, t in enumerate(times):
+                if t < t0 or t > t1:
+                    continue
+                for var, v0, v1 in ramps:
+                    if t1 == t0: vt = v1
                     else:
-                        alpha=(t-t0)/(t1-t0)
-                        alpha=0.0 if alpha<0 else (1.0 if alpha>1 else alpha)
-                        vt = v0 + alpha*(v1-v0)
-                    state[var]=vt
+                        alpha = (t - t0) / (t1 - t0)
+                        alpha = 0.0 if alpha < 0 else (1.0 if alpha > 1 else alpha)
+                        vt = v0 + alpha * (v1 - v0)
+                    state[var] = vt
                 for var in series.keys():
-                    val = state.get(var, series[var][idx-1] if idx>0 else None)
-                    series[var][idx]=val
+                    val = state.get(var, series[var][idx - 1] if idx > 0 else None)
+                    series[var][idx] = val
 
         # forward-fill
         for var, arr in series.items():
-            last=None
-            for i,v in enumerate(arr):
-                if v is None and last is not None: arr[i]=last
-                elif v is not None: last=v
+            last = None
+            for i, v in enumerate(arr):
+                if v is None and last is not None: arr[i] = last
+                elif v is not None: last = v
+
         return times, series, windows
 
 # --------------------------
@@ -253,7 +276,6 @@ def to_numeric_array(arr: List[Any]) -> np.ndarray:
     return np.array(out, dtype=float)
 
 def plot_overlay(times, series, vars_to_plot):
-    import matplotlib.pyplot as plt
     plt.figure()
     for var in vars_to_plot:
         if var not in series: continue
@@ -268,7 +290,6 @@ def plot_overlay(times, series, vars_to_plot):
     st.pyplot(plt.gcf()); plt.close()
 
 def plot_separate(times, series, vars_to_plot):
-    import matplotlib.pyplot as plt
     for var in vars_to_plot:
         if var not in series: continue
         plt.figure()
@@ -302,9 +323,9 @@ with st.expander("옵션", expanded=True):
     absolute = st.checkbox("타임스탬프를 절대 시간으로 해석", value=False, key="abs")
     mode = st.radio("단일 파일 플롯 모드", ["겹쳐 그리기(한 그림)", "변수별 분리"], horizontal=True, key="mode")
 
-# ==========================
+# --------------------------
 # A) 단일 레시피 뷰
-# ==========================
+# --------------------------
 uploaded = st.file_uploader("단일 레시피 업로드 (.txt)", type=["txt"])
 use_demo = st.checkbox("내장 데모 사용", value=False)
 
@@ -340,7 +361,7 @@ if uploaded or use_demo:
         st.download_button("CSV 다운로드(단일)", data=df_single.to_csv(index=False).encode("utf-8-sig"),
                            file_name="timeline_single.csv", mime="text/csv")
 
-        # --- 요약 ---
+        # 요약
         with st.expander("요약", expanded=True):
             st.write(f"총 스텝(전개 후): {len(recipe.steps)} | 총 시간: {times[-1]} s")
             if parser.loop_blocks:
@@ -354,7 +375,7 @@ if uploaded or use_demo:
                                  "Total sec": cycle_dur * lb["count"]})
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-        # --- 루프 패턴 ---
+        # 루프 패턴
         with st.expander("루프 패턴", expanded=True):
             if parser.loop_blocks:
                 for lb in parser.loop_blocks:
@@ -366,7 +387,7 @@ if uploaded or use_demo:
             else:
                 st.info("요약할 loop가 없습니다.")
 
-        # --- 상세 로그 ---
+        # 상세 로그
         with st.expander("전체 스텝 로그 (상세)", expanded=False):
             preview_n = st.slider("미리보기 개수", 10, 200, 50, step=10, key="preview_n_single")
             for i,(t0,t1,stp) in enumerate(windows[:preview_n],1):
@@ -374,33 +395,30 @@ if uploaded or use_demo:
             if len(windows) > preview_n:
                 st.text(f"... (총 {len(windows)}개 중 {preview_n}개 표시)")
 
-        # --- 플롯 ---
+        # 플롯
         if picked:
             if mode.startswith("겹쳐"): plot_overlay(times, series, picked)
             else:                      plot_separate(times, series, picked)
 
-# ==========================
+# --------------------------
 # B) 배치 비교 (여러 레시피 업로드)
-# ==========================
+# --------------------------
 st.markdown("---")
 st.header("🧪 배치 비교 (여러 레시피 업로드)")
 
 files = st.file_uploader("여러 레시피 업로드 (.txt)", type=["txt"], accept_multiple_files=True, key="multi_up")
 if files:
-    # 파일명, 텍스트 리스트
     file_tuples = [(f.name, f.read().decode("utf-8", errors="ignore")) for f in files]
 
-    # 모든 변수 후보 (첫 파일 기준 + 합집합)
+    # 변수 후보(간단히 첫 파일 기준)
     all_vars = set()
-    # 빠르게 후보 만들기: 첫 파일만 간단 파싱
     try:
         p0 = Parser(True); r0 = p0.parse(file_tuples[0][1])
-        t0, s0, _ = Timeline(dt=1, absolute=False).build(r0)
+        _, s0, _ = Timeline(dt=1, absolute=False).build(r0)
         all_vars.update(s0.keys())
     except Exception:
         pass
 
-    # UI: 비교 변수
     all_vars = sorted(all_vars) if all_vars else []
     default_vars = [v for v in ["CeilingTemp","ReactorTemp","ReactorPress","RF_U","NH3_1.source"] if v in all_vars] or all_vars[:3]
     vars_to_compare = st.multiselect("비교할 변수 선택", all_vars, default=default_vars, key="cmp_vars")
@@ -408,12 +426,10 @@ if files:
     align_zero = st.checkbox("각 run을 t=0으로 정렬(권장)", value=True, key="align0")
 
     if vars_to_compare:
-        # 초고속 이벤트 기반 비교
         figs = compare_memory(file_tuples, vars=vars_to_compare, align_zero=align_zero)
         for var, fig in figs.items():
             st.plotly_chart(fig, use_container_width=True)
 
-        # tidy CSV 다운로드
         df_tidy = tidy_memory(file_tuples, vars=vars_to_compare, align_zero=align_zero)
         st.download_button("CSV 다운로드(배치 tidy)", data=df_tidy.to_csv(index=False).encode("utf-8-sig"),
                            file_name="batch_tidy.csv", mime="text/csv")
