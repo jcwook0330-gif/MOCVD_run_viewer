@@ -2,6 +2,7 @@
 # MOCVD Recipe Visualizer (Streamlit)
 # - 단일 레시피: 루프 전개 + 루프 요약 표 + 루프 패턴 뷰 + 상세 로그 + 플롯
 # - 배치 비교: 여러 파일 업로드 → 변수별 run 비교(Plotly, 이벤트 기반 빠른 렌더)
+# - 추가: Peak ReactorTemp vs Pre-loop ReactorPress 산점도
 # - 주석(#/ // / 구분선) 무시, 마지막 세미콜론 누락 허용, '='(즉시), 'to'(선형 램프)
 
 import re
@@ -13,8 +14,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# 배치 비교용 빠른 엔진 (Plotly)
-from fast_compare import compare_memory, tidy_memory
+# 배치 비교용 빠른 엔진 (Plotly) + 새 산점도 피처계산
+from fast_compare import (
+    compare_memory, tidy_memory,
+    scatter_features_memory  # (new) DF + Figure 산출
+)
 
 # --------------------------
 # 정규식 & 헬퍼
@@ -81,7 +85,7 @@ def expand_loops_with_blocks(text: str):
 @dataclass
 class Action:
     var: str
-    op: str      # '=' or 'to'
+    op: str
     raw_value: str
     value: Any = None
     def parse_value(self):
@@ -207,11 +211,11 @@ class Timeline:
             ramps: List[Tuple[str, float, float]] = []
             jumps: List[Tuple[str, Any]] = []
 
-            # 액션 수집: 점프('='), 램프('to')
+            # 점프('='), 램프('to')
             for a in st.actions:
                 if a.op == '=':
                     val = a.value
-                    b = to_boolish(val)     # 'open'/'close' 등 처리
+                    b = to_boolish(val)
                     val = b if b is not None else val
                     jumps.append((a.var, val))
 
@@ -223,7 +227,6 @@ class Timeline:
                     if isinstance(prev, (int, float)) and isinstance(val, (int, float)):
                         ramps.append((a.var, float(prev), float(val)))
                     else:
-                        # 숫자 램프 불가 → 구간 끝에서 점프
                         jumps.append((a.var, val))
 
             # 점프 먼저 반영
@@ -307,7 +310,7 @@ def plot_separate(times, series, vars_to_plot):
 # --------------------------
 def summarize_loop_steps(block_text: str):
     tmp_parser = Parser(tolerate_missing_semicolon=True)
-    tmp_recipe = tmp_parser.parse(block_text)  # block_text 내부는 이미 전개됨
+    tmp_recipe = tmp_parser.parse(block_text)
     items = [(st.time_s, (st.comment or '').strip()) for st in tmp_recipe.steps]
     total_sec = sum(d for d, _ in items)
     return items, total_sec, len(items)
@@ -316,7 +319,7 @@ def summarize_loop_steps(block_text: str):
 # Streamlit UI
 # --------------------------
 st.set_page_config(page_title="MOCVD Recipe Visualizer", layout="wide")
-st.title("📈 MOCVD 레시피 시각화 (단일 + 배치 비교)")
+st.title("📈 MOCVD 레시피 시각화 (단일 + 배치 비교 + 산점도)")
 
 with st.expander("옵션", expanded=True):
     dt = st.number_input("샘플링 간격 dt (s)", min_value=1, value=1, step=1, key="dt")
@@ -324,7 +327,7 @@ with st.expander("옵션", expanded=True):
     mode = st.radio("단일 파일 플롯 모드", ["겹쳐 그리기(한 그림)", "변수별 분리"], horizontal=True, key="mode")
 
 # --------------------------
-# A) 단일 레시피 뷰
+# A) 단일 레시피
 # --------------------------
 uploaded = st.file_uploader("단일 레시피 업로드 (.txt)", type=["txt"])
 use_demo = st.checkbox("내장 데모 사용", value=False)
@@ -361,7 +364,6 @@ if uploaded or use_demo:
         st.download_button("CSV 다운로드(단일)", data=df_single.to_csv(index=False).encode("utf-8-sig"),
                            file_name="timeline_single.csv", mime="text/csv")
 
-        # 요약
         with st.expander("요약", expanded=True):
             st.write(f"총 스텝(전개 후): {len(recipe.steps)} | 총 시간: {times[-1]} s")
             if parser.loop_blocks:
@@ -375,7 +377,6 @@ if uploaded or use_demo:
                                  "Total sec": cycle_dur * lb["count"]})
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-        # 루프 패턴
         with st.expander("루프 패턴", expanded=True):
             if parser.loop_blocks:
                 for lb in parser.loop_blocks:
@@ -387,7 +388,6 @@ if uploaded or use_demo:
             else:
                 st.info("요약할 loop가 없습니다.")
 
-        # 상세 로그
         with st.expander("전체 스텝 로그 (상세)", expanded=False):
             preview_n = st.slider("미리보기 개수", 10, 200, 50, step=10, key="preview_n_single")
             for i,(t0,t1,stp) in enumerate(windows[:preview_n],1):
@@ -395,7 +395,6 @@ if uploaded or use_demo:
             if len(windows) > preview_n:
                 st.text(f"... (총 {len(windows)}개 중 {preview_n}개 표시)")
 
-        # 플롯
         if picked:
             if mode.startswith("겹쳐"): plot_overlay(times, series, picked)
             else:                      plot_separate(times, series, picked)
@@ -433,3 +432,11 @@ if files:
         df_tidy = tidy_memory(file_tuples, vars=vars_to_compare, align_zero=align_zero)
         st.download_button("CSV 다운로드(배치 tidy)", data=df_tidy.to_csv(index=False).encode("utf-8-sig"),
                            file_name="batch_tidy.csv", mime="text/csv")
+
+    # -------- NEW: 산점도 (Peak Temp vs Pre-loop Press) --------
+    st.subheader("📍 분산도: Peak ReactorTemp  vs  Pre-loop ReactorPress")
+    df_feat, fig_scatter = scatter_features_memory(file_tuples)
+    st.plotly_chart(fig_scatter, use_container_width=True)
+    st.dataframe(df_feat, use_container_width=True)
+    st.download_button("CSV 다운로드(산점도 피처)", data=df_feat.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="scatter_features.csv", mime="text/csv")
