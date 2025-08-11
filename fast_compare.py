@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # Fast MOCVD Recipe Comparator (Plotly, event-based)
-# + 산점도 피처: Peak ReactorTemp, Pre-loop ReactorPress
+# + 산점도 피처: Peak ReactorTemp, Pre-Stabilization(없으면 Pre-loop) ReactorPress
 
 import re
 from dataclasses import dataclass, field
@@ -13,7 +13,11 @@ import pandas as pd
 DURATION_RE = re.compile(r'^(?P<h>\d{1,2}):(?P<m>\d{2}):(?P<s>\d{2})\s*')
 COMMENT_RE  = re.compile(r'^\s*"(?P<comment>[^"]*)"\s*,?')
 ACTION_RE   = re.compile(r'\s*(?P<var>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*(?P<op>=|to)\s*(?P<val>[^,;]+)\s*(?:,|;)?')
-LOOP_RE     = re.compile(r'\bloop\s+\d+\s*\{', re.IGNORECASE)
+
+# loop 키워드(텍스트 레벨에서 탐지용)
+LOOP_KW_RE  = re.compile(r'\bloop\s+\d+\s*\{', re.IGNORECASE)
+# stabilization 키워드(코멘트에 다양하게 등장할 수 있음)
+STAB_TXT_RE = re.compile(r'stabil', re.IGNORECASE)  # Stabilization/Stabilisation/Stabilize 등 포괄
 
 C_TRUE  = {'on','open','enable','enabled','start','true','high'}
 C_FALSE = {'off','close','closed','disable','disabled','stop','false','low'}
@@ -36,10 +40,10 @@ def boolish(v: Any) -> Optional[int]:
     return None
 
 # --------------------------
-# Loop expander
+# Loop expander (문장 수준 전개)
 # --------------------------
 def expand_loops(text: str) -> str:
-    loop_pat = LOOP_RE
+    loop_pat = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
     def _expand(s: str) -> str:
         out, i, L = [], 0, len(s)
         while i < L:
@@ -47,7 +51,7 @@ def expand_loops(text: str) -> str:
             if not m:
                 out.append(s[i:]); break
             out.append(s[i:m.start()])
-            count = int(re.search(r'\d+', m.group(0)).group())
+            count = int(m.group(1))
             j = m.end(); depth = 1
             while j < L and depth > 0:
                 if s[j] == '{': depth += 1
@@ -212,7 +216,7 @@ def _parse_cached(text: str) -> Recipe:
     return parser.parse(text)
 
 # --------------------------
-# Batch compare (기존)
+# Public: batch compare (기존)
 # --------------------------
 def compare_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=True) -> Dict[str, "go.Figure"]:
     runs = []
@@ -260,10 +264,11 @@ def tidy_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=
     return pd.DataFrame(rows)
 
 # --------------------------
-# NEW: 산점도 피처 계산
+# NEW: 산점도용 피처
+#   x = Peak ReactorTemp (전체)
+#   y = Pre-stabilization ReactorPress  (없으면 Pre-loop, 둘 다 없으면 None)
 # --------------------------
 def _preclean_text(text: str) -> str:
-    """Parser._preclean과 동일 동작(클래스 외부 유틸)."""
     out_lines = []
     for raw in text.splitlines():
         line = raw.rstrip("\n")
@@ -277,11 +282,14 @@ def _preclean_text(text: str) -> str:
         out_lines.append(line)
     return "\n".join(out_lines)
 
-def _preloop_subtext(text: str) -> str:
-    """첫 loop 이전 구간만 반환(없으면 전체 반환)."""
-    cleaned = _preclean_text(text)
-    m = LOOP_RE.search(cleaned)
-    return cleaned[:m.start()] if m else cleaned
+def _first_stabilization_time(recipe: Recipe) -> Optional[float]:
+    t = 0.0
+    for st in recipe.steps:
+        comment = (st.comment or "").lower()
+        if STAB_TXT_RE.search(comment):
+            return t  # 해당 스텝 시작 시각
+        t += st.dur_s
+    return None
 
 def _peak_temp_from_text(text: str) -> Optional[float]:
     recipe = _parse_cached(text)
@@ -291,33 +299,60 @@ def _peak_temp_from_text(text: str) -> Optional[float]:
     vals = [v for (_, v) in pts if v is not None]
     return max(vals) if vals else None
 
+def _press_before_time(recipe: Recipe, t_cut: float) -> Optional[float]:
+    """t_cut 직전의 ReactorPress 값을 반환."""
+    series_cp, _ = build_change_points(recipe, ["ReactorPress"])
+    pts = series_cp.get("ReactorPress", [])
+    if not pts: return None
+    prev_val = None
+    for (t, v) in pts:
+        if t < t_cut:
+            prev_val = v
+        else:
+            break
+    return prev_val
+
 def _preloop_press_from_text(text: str) -> Optional[float]:
-    pre = _preloop_subtext(text)
-    # pre 구간만 다시 파싱 (loop 없음)
+    """fallback: 첫 loop 키워드 이전 텍스트로 파싱하여 마지막 압력."""
+    cleaned = _preclean_text(text)
+    m = LOOP_KW_RE.search(cleaned)
+    pre = cleaned[:m.start()] if m else cleaned
     recipe = _parse_cached(pre)
     series_cp, _ = build_change_points(recipe, ["ReactorPress"])
     pts = series_cp.get("ReactorPress", [])
     if not pts: return None
-    return pts[-1][1]  # 마지막 값 = loop 직전 압력
+    return pts[-1][1]
+
+def _pre_stabilization_or_loop_press(text: str) -> Optional[float]:
+    """우선순위: Stabilization 직전 → Loop 직전 → None"""
+    recipe = _parse_cached(text)
+    t_stab = _first_stabilization_time(recipe)
+    if t_stab is not None:
+        val = _press_before_time(recipe, t_stab)
+        if val is not None:
+            return val
+    # fallback
+    return _preloop_press_from_text(text)
 
 def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame, "go.Figure"]:
     rows = []
     for name, txt in files:
         x = _peak_temp_from_text(txt)
-        y = _preloop_press_from_text(txt)
-        rows.append({"run": name, "ReactorTemp_peak": x, "ReactorPress_preloop": y})
+        y = _pre_stabilization_or_loop_press(txt)
+        rows.append({"run": name, "ReactorTemp_peak": x, "ReactorPress_preRef": y})
     df = pd.DataFrame(rows)
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=df["ReactorTemp_peak"], y=df["ReactorPress_preloop"],
+        x=df["ReactorTemp_peak"], y=df["ReactorPress_preRef"],
         mode="markers+text", text=df["run"], textposition="top center",
         name="runs"
     ))
     fig.update_layout(
-        title="Peak ReactorTemp  vs  Pre-loop ReactorPress",
+        title="Peak ReactorTemp  vs  Pre-Ref ReactorPress (Stabilization≻Loop)",
         xaxis_title="Peak ReactorTemp",
-        yaxis_title="Pre-loop ReactorPress",
+        yaxis_title="Pre-Ref ReactorPress",
         template="plotly_white"
     )
     return df, fig
+
