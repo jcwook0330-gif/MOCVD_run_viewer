@@ -24,7 +24,7 @@ RUN_NO_HEAD = re.compile(r'^\s*(\d+)')
 def extract_run_no(name: str) -> str:
     m = RUN_NO_HEAD.match(name)
     if m: return m.group(1)
-    m2 = re.search(r'(\d+)', name)
+    m2 = re.search(r'(\d+)', name)    # 폴백: 첫 숫자 시퀀스
     return m2.group(1) if m2 else name
 
 C_TRUE  = {'on','open','enable','enabled','start','true','high'}
@@ -339,11 +339,12 @@ def _pre_stabilization_or_loop_press(text: str) -> Optional[float]:
 def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame, "go.Figure"]:
     rows = []
     for name, txt in files:
+        run_no = extract_run_no(name)              # 숫자 라벨 추출
         x = _peak_temp_from_text(txt)
         y = _pre_stabilization_or_loop_press(txt)
         rows.append({
             "run": name,
-            "run_no": extract_run_no(name),    # 라벨용 run number
+            "run_no": run_no,
             "ReactorTemp_peak": x,
             "ReactorPress_preRef": y
         })
@@ -354,11 +355,13 @@ def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame,
         x=df["ReactorTemp_peak"],
         y=df["ReactorPress_preRef"],
         mode="markers+text",
-        text=df["run_no"],                  # 숫자 라벨만
+        text=df["run_no"].astype(str),            # 점 위 텍스트 = run number
         textposition="top center",
-        name="runs",
-        hovertemplate="run=%{text}<br>PeakT=%{x}<br>PreRefP=%{y}<extra></extra>"
+        hovertext=df["run"],                      # 호버에는 전체 파일명
+        hoverinfo="text+x+y",
+        name="runs"
     ))
+    fig.update_traces(textfont=dict(size=10))
     fig.update_layout(
         title="Peak ReactorTemp  vs  Pre-Ref ReactorPress (label: run#)",
         xaxis_title="Peak ReactorTemp",
