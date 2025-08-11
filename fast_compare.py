@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # Fast MOCVD Recipe Comparator (Plotly, event-based)
+# + 산점도 피처: Peak ReactorTemp, Pre-loop ReactorPress
 
 import re
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ import pandas as pd
 DURATION_RE = re.compile(r'^(?P<h>\d{1,2}):(?P<m>\d{2}):(?P<s>\d{2})\s*')
 COMMENT_RE  = re.compile(r'^\s*"(?P<comment>[^"]*)"\s*,?')
 ACTION_RE   = re.compile(r'\s*(?P<var>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*(?P<op>=|to)\s*(?P<val>[^,;]+)\s*(?:,|;)?')
+LOOP_RE     = re.compile(r'\bloop\s+\d+\s*\{', re.IGNORECASE)
 
 C_TRUE  = {'on','open','enable','enabled','start','true','high'}
 C_FALSE = {'off','close','closed','disable','disabled','stop','false','low'}
@@ -33,8 +35,11 @@ def boolish(v: Any) -> Optional[int]:
         if lv in C_FALSE: return 0
     return None
 
+# --------------------------
+# Loop expander
+# --------------------------
 def expand_loops(text: str) -> str:
-    loop_pat = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
+    loop_pat = LOOP_RE
     def _expand(s: str) -> str:
         out, i, L = [], 0, len(s)
         while i < L:
@@ -42,7 +47,7 @@ def expand_loops(text: str) -> str:
             if not m:
                 out.append(s[i:]); break
             out.append(s[i:m.start()])
-            count = int(m.group(1))
+            count = int(re.search(r'\d+', m.group(0)).group())
             j = m.end(); depth = 1
             while j < L and depth > 0:
                 if s[j] == '{': depth += 1
@@ -54,6 +59,9 @@ def expand_loops(text: str) -> str:
         return ''.join(out)
     return _expand(text)
 
+# --------------------------
+# Parser (lenient)
+# --------------------------
 @dataclass
 class Action:
     var: str
@@ -143,6 +151,9 @@ class Parser:
             a.parse_value(); actions.append(a); i = m3.end()
         return Step(dur_s=dur, comment=comment, actions=actions)
 
+# --------------------------
+# Change-point builder (no dt)
+# --------------------------
 def build_change_points(recipe: Recipe, variables: Iterable[str]) -> Tuple[Dict[str, List[Tuple[float, float]]], float]:
     wanted = set(variables)
     state: Dict[str, Any] = {}
@@ -186,17 +197,23 @@ def build_change_points(recipe: Recipe, variables: Iterable[str]) -> Tuple[Dict[
         pts.sort(key=lambda x: x[0])
         cleaned, last_v = [], None
         for (t, v) in pts:
-            if last_v is not None and abs(v - last_v) < 1e-12:  # dedup
+            if last_v is not None and abs(v - last_v) < 1e-12:
                 continue
             cleaned.append((t, v)); last_v = v
         series_cp[var] = cleaned
     return series_cp, total_T
 
+# --------------------------
+# Cache by content
+# --------------------------
 @lru_cache(maxsize=256)
 def _parse_cached(text: str) -> Recipe:
     parser = Parser(tolerate_missing_semicolon=True)
     return parser.parse(text)
 
+# --------------------------
+# Batch compare (기존)
+# --------------------------
 def compare_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=True) -> Dict[str, "go.Figure"]:
     runs = []
     for name, txt in files:
@@ -241,3 +258,66 @@ def tidy_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=
             for (t, v) in pts:
                 rows.append({"run": name, "variable": var, "time_s": t - base, "value": v})
     return pd.DataFrame(rows)
+
+# --------------------------
+# NEW: 산점도 피처 계산
+# --------------------------
+def _preclean_text(text: str) -> str:
+    """Parser._preclean과 동일 동작(클래스 외부 유틸)."""
+    out_lines = []
+    for raw in text.splitlines():
+        line = raw.rstrip("\n")
+        s = line.strip()
+        if not s: continue
+        if s.startswith("#") or s.startswith("//"): continue
+        if all(ch in "#-=*" for ch in s): continue
+        if "#" in line:
+            line = line.split("#", 1)[0].rstrip()
+            if not line.strip(): continue
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+def _preloop_subtext(text: str) -> str:
+    """첫 loop 이전 구간만 반환(없으면 전체 반환)."""
+    cleaned = _preclean_text(text)
+    m = LOOP_RE.search(cleaned)
+    return cleaned[:m.start()] if m else cleaned
+
+def _peak_temp_from_text(text: str) -> Optional[float]:
+    recipe = _parse_cached(text)
+    series_cp, _ = build_change_points(recipe, ["ReactorTemp"])
+    pts = series_cp.get("ReactorTemp", [])
+    if not pts: return None
+    vals = [v for (_, v) in pts if v is not None]
+    return max(vals) if vals else None
+
+def _preloop_press_from_text(text: str) -> Optional[float]:
+    pre = _preloop_subtext(text)
+    # pre 구간만 다시 파싱 (loop 없음)
+    recipe = _parse_cached(pre)
+    series_cp, _ = build_change_points(recipe, ["ReactorPress"])
+    pts = series_cp.get("ReactorPress", [])
+    if not pts: return None
+    return pts[-1][1]  # 마지막 값 = loop 직전 압력
+
+def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame, "go.Figure"]:
+    rows = []
+    for name, txt in files:
+        x = _peak_temp_from_text(txt)
+        y = _preloop_press_from_text(txt)
+        rows.append({"run": name, "ReactorTemp_peak": x, "ReactorPress_preloop": y})
+    df = pd.DataFrame(rows)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=df["ReactorTemp_peak"], y=df["ReactorPress_preloop"],
+        mode="markers+text", text=df["run"], textposition="top center",
+        name="runs"
+    ))
+    fig.update_layout(
+        title="Peak ReactorTemp  vs  Pre-loop ReactorPress",
+        xaxis_title="Peak ReactorTemp",
+        yaxis_title="Pre-loop ReactorPress",
+        template="plotly_white"
+    )
+    return df, fig
