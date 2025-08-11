@@ -2,7 +2,8 @@
 # MOCVD Recipe Visualizer (Streamlit)
 # - 단일 레시피: 루프 전개 + 루프 요약 표 + 루프 패턴 뷰 + 상세 로그 + 플롯
 # - 배치 비교: 여러 파일 업로드 → 변수별 run 비교(Plotly, 이벤트 기반 빠른 렌더)
-# - 산점도: Peak ReactorTemp (x) vs Pre-Stabilization(없으면 Pre-loop) ReactorPress (y)
+# - 산점도: Peak ReactorTemp (x) vs Pre-Stabilization(없으면 Pre-loop) ReactorPress (y), 라벨=run#
+# - Loop 분석: 파일별 loop 개수/시간 요약 + 1cycle 상세(step-by-step)
 # - 주석(#/ // / 구분선) 무시, 마지막 세미콜론 누락 허용, '='(즉시), 'to'(선형 램프)
 
 import re
@@ -14,9 +15,12 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-# 배치 비교 + 산점도 피처
+# 배치 비교 + 산점도 + 루프 분석 유틸
 from fast_compare import (
-    compare_memory, tidy_memory, scatter_features_memory
+    compare_memory,
+    tidy_memory,
+    scatter_features_memory,
+    loops_summary_memory,
 )
 
 # --------------------------
@@ -216,7 +220,6 @@ class Timeline:
                     b = to_boolish(val)
                     val = b if b is not None else val
                     jumps.append((a.var, val))
-
                 elif a.op == 'to':
                     prev = state.get(a.var)
                     val = a.value
@@ -239,7 +242,8 @@ class Timeline:
                 if t < t0 or t > t1:
                     continue
                 for var, v0, v1 in ramps:
-                    if t1 == t0: vt = v1
+                    if t1 == t0:
+                        vt = v1
                     else:
                         alpha = (t - t0) / (t1 - t0)
                         alpha = 0.0 if alpha < 0 else (1.0 if alpha > 1 else alpha)
@@ -252,8 +256,10 @@ class Timeline:
         for var, arr in series.items():
             last = None
             for i, v in enumerate(arr):
-                if v is None and last is not None: arr[i] = last
-                elif v is not None: last = v
+                if v is None and last is not None:
+                    arr[i] = last
+                elif v is not None:
+                    last = v
 
         return times, series, windows
 
@@ -267,9 +273,12 @@ def to_numeric_array(arr: List[Any]) -> np.ndarray:
     out = []
     for v in arr:
         b = to_boolish(v)
-        if b is not None: out.append(float(b))
-        elif isinstance(v,(int,float)): out.append(float(v))
-        else: out.append(np.nan)
+        if b is not None:
+            out.append(float(b))
+        elif isinstance(v,(int,float)):
+            out.append(float(v))
+        else:
+            out.append(np.nan)
     return np.array(out, dtype=float)
 
 def plot_overlay(times, series, vars_to_plot):
@@ -300,7 +309,7 @@ def plot_separate(times, series, vars_to_plot):
         plt.grid(True); plt.legend(); st.pyplot(plt.gcf()); plt.close()
 
 # --------------------------
-# 루프 패턴 요약 헬퍼
+# 루프 패턴 요약 헬퍼 (단일 화면용 텍스트)
 # --------------------------
 def summarize_loop_steps(block_text: str):
     tmp_parser = Parser(tolerate_missing_semicolon=True)
@@ -313,7 +322,7 @@ def summarize_loop_steps(block_text: str):
 # Streamlit UI
 # --------------------------
 st.set_page_config(page_title="MOCVD Recipe Visualizer", layout="wide")
-st.title("📈 MOCVD 레시피 시각화 (단일 + 배치 비교 + 산점도)")
+st.title("📈 MOCVD 레시피 시각화 (단일 + 배치 비교 + 산점도 + 루프 분석)")
 
 with st.expander("옵션", expanded=True):
     dt = st.number_input("샘플링 간격 dt (s)", min_value=1, value=1, step=1, key="dt")
@@ -369,7 +378,7 @@ if uploaded or use_demo:
                                  "Total sec": cycle_dur * lb["count"]})
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-        with st.expander("루프 패턴", expanded=True):
+        with st.expander("루프 패턴 (1 cycle 요약)", expanded=True):
             if parser.loop_blocks:
                 for lb in parser.loop_blocks:
                     items, cycle_sec, cycle_steps = summarize_loop_steps(lb["block_text"])
@@ -388,8 +397,10 @@ if uploaded or use_demo:
                 st.text(f"... (총 {len(windows)}개 중 {preview_n}개 표시)")
 
         if picked:
-            if mode.startswith("겹쳐"): plot_overlay(times, series, picked)
-            else:                      plot_separate(times, series, picked)
+            if mode.startswith("겹쳐"):
+                plot_overlay(times, series, picked)
+            else:
+                plot_separate(times, series, picked)
 
 # ---- B) 배치 비교
 st.markdown("---")
@@ -430,3 +441,39 @@ if files:
     st.dataframe(df_feat, use_container_width=True)
     st.download_button("CSV 다운로드(산점도 피처)", data=df_feat.to_csv(index=False).encode("utf-8-sig"),
                        file_name="scatter_features.csv", mime="text/csv")
+
+    # ---------- NEW: Loop 분석 ----------
+    with st.expander("🔁 Loop 분석 (요약/상세)", expanded=False):
+        df_loops, df_steps = loops_summary_memory(file_tuples)
+
+        st.markdown("**요약표 (파일별 loop)**")
+        st.dataframe(df_loops, use_container_width=True)
+        st.download_button(
+            "CSV 다운로드(Loop 요약)",
+            data=df_loops.to_csv(index=False).encode("utf-8-sig"),
+            file_name="loops_summary.csv", mime="text/csv"
+        )
+
+        st.markdown("**상세표 (1 cycle step-by-step)**")
+        if not df_steps.empty:
+            runs = sorted(df_steps["run"].unique().tolist())
+            pick_run = st.selectbox("Run 선택", runs, index=0, key="loop_run")
+            loops_in_run = sorted(df_steps[df_steps["run"]==pick_run]["loop_id"].unique().tolist())
+            pick_loop = st.selectbox("Loop 선택", loops_in_run, index=0, key="loop_id")
+
+            view = df_steps[(df_steps["run"]==pick_run) & (df_steps["loop_id"]==pick_loop)] \
+                    .sort_values("step_idx")
+            st.dataframe(view, use_container_width=True)
+
+            # 패턴 미니 요약(한 줄)
+            lines = [f"({int(r.duration_s)}s) comment='{r.comment}' | actions='{r.actions}'"
+                     for r in view.itertuples()]
+            st.code("\n".join(lines), language="text")
+
+            st.download_button(
+                "CSV 다운로드(Loop 상세-선택)",
+                data=view.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"loop_steps_{pick_loop}.csv", mime="text/csv"
+            )
+        else:
+            st.info("업로드한 레시피에서 loop를 찾지 못했습니다.")
