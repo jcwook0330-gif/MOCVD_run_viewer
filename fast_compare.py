@@ -2,6 +2,7 @@
 # Fast MOCVD Recipe Comparator (Plotly, event-based)
 # + 산점도 피처: Peak ReactorTemp, Pre-Stabilization(없으면 Pre-loop) ReactorPress
 # + 산점도 라벨: 파일명 맨 앞 숫자(run number)만 표시
+# + NEW: 여러 레시피에서 loop 요약/상세 테이블 생성
 
 import re
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ COMMENT_RE  = re.compile(r'^\s*"(?P<comment>[^"]*)"\s*,?')
 ACTION_RE   = re.compile(r'\s*(?P<var>[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s*(?P<op>=|to)\s*(?P<val>[^,;]+)\s*(?:,|;)?')
 
 # 키워드 탐지
-LOOP_KW_RE  = re.compile(r'\bloop\s+\d+\s*\{', re.IGNORECASE)
+LOOP_KW_RE  = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
 STAB_TXT_RE = re.compile(r'stabil', re.IGNORECASE)  # Stabilization/ize/isation 등 포괄
 
 # 파일명 맨 앞 숫자(run number) 추출
@@ -48,7 +49,7 @@ def boolish(v: Any) -> Optional[int]:
     return None
 
 # --------------------------
-# Loop expander
+# Loop expander (문자열 전개)
 # --------------------------
 def expand_loops(text: str) -> str:
     loop_pat = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
@@ -272,7 +273,7 @@ def tidy_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=
     return pd.DataFrame(rows)
 
 # --------------------------
-# NEW: 산점도용 피처 (Peak T, Pre-Ref P: Stabilization≻Loop)
+# 텍스트 전처리 + loop 블록 추출
 # --------------------------
 def _preclean_text(text: str) -> str:
     out_lines = []
@@ -288,6 +289,37 @@ def _preclean_text(text: str) -> str:
         out_lines.append(line)
     return "\n".join(out_lines)
 
+def _extract_loop_blocks(text: str) -> List[Dict[str, str]]:
+    """clean 텍스트에서 loop 블록을 찾아 [{count, block_text}, ...] 반환 (중첩 포함, 바깥→안쪽 순)."""
+    s = _preclean_text(text)
+    loop_pat = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
+
+    def walk(seg: str) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        i, L = 0, len(seg)
+        while i < L:
+            m = loop_pat.search(seg, i)
+            if not m:
+                break
+            count = int(m.group(1))
+            j = m.end(); depth = 1
+            while j < L and depth > 0:
+                ch = seg[j]
+                if ch == '{': depth += 1
+                elif ch == '}': depth -= 1
+                j += 1
+            inner = seg[m.end(): j-1]
+            out.append({"count": count, "block_text": inner})
+            # 중첩 loop도 따로 기록
+            out.extend(walk(inner))
+            i = j
+        return out
+
+    return walk(s)
+
+# --------------------------
+# NEW: 산점도용 피처 (Peak T, Pre-Ref P: Stabilization≻Loop)
+# --------------------------
 def _first_stabilization_time(recipe: Recipe) -> Optional[float]:
     t = 0.0
     for st in recipe.steps:
@@ -369,3 +401,55 @@ def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame,
         template="plotly_white"
     )
     return df, fig
+
+# --------------------------
+# NEW: 여러 레시피의 loop 요약/상세 테이블 생성
+# --------------------------
+def loops_summary_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    반환:
+      df_loops:  run, loop_id(1..), cycles, steps_per_cycle, sec_per_cycle, total_sec
+      df_steps:  run, loop_id, step_idx(1..), duration_s, comment, actions, cycles
+    """
+    loops_rows, steps_rows = [], []
+
+    for name, txt in files:
+        blocks = _extract_loop_blocks(txt)  # [{count, block_text}, ...]
+        if not blocks:
+            continue
+        for idx, lb in enumerate(blocks, start=1):
+            # loop 내부 1 cycle 파싱
+            recipe = _parse_cached(lb["block_text"])
+            steps = recipe.steps
+            sec_per_cycle = sum(s.dur_s for s in steps)
+            loops_rows.append({
+                "run": name,
+                "loop_id": idx,
+                "cycles": lb["count"],
+                "steps_per_cycle": len(steps),
+                "sec_per_cycle": sec_per_cycle,
+                "total_sec": sec_per_cycle * lb["count"],
+            })
+            # 상세 step 나열
+            for k, st in enumerate(steps, start=1):
+                actions_str = "; ".join(
+                    f"{a.var} {a.op} {a.raw_value}".strip()
+                    for a in st.actions
+                )
+                steps_rows.append({
+                    "run": name,
+                    "loop_id": idx,
+                    "step_idx": k,
+                    "duration_s": st.dur_s,
+                    "comment": (st.comment or ""),
+                    "actions": actions_str,
+                    "cycles": lb["count"],
+                })
+
+    df_loops = pd.DataFrame(loops_rows) if loops_rows else pd.DataFrame(
+        columns=["run","loop_id","cycles","steps_per_cycle","sec_per_cycle","total_sec"]
+    )
+    df_steps = pd.DataFrame(steps_rows) if steps_rows else pd.DataFrame(
+        columns=["run","loop_id","step_idx","duration_s","comment","actions","cycles"]
+    )
+    return df_loops, df_steps
