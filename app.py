@@ -202,11 +202,17 @@ class Timeline:
             for a in st.actions:
                 if a.op=='=':
                     jumps.append((a.var,a.value))
-                elif a.op=='to':
-                    if isinstance(a.value,(int,float)) and isinstance(state.get(a.var,(int,float))):
-                        ramps.append((a.var,float(state[a.var]),float(a.value)))
+                    elif a.op == 'to':
+                        prev = state.get(a.var)
+                        val  = a.value
+                          b = to_boolish(val)           # 'open'→1, 'close'→0
+                        val = b if b is not None else val
+
+                    if isinstance(prev, (int, float)) and isinstance(val, (int, float)):
+                        ramps.append((a.var, float(prev), float(val)))
                     else:
-                        jumps.append((a.var,a.value))
+                        jumps.append((a.var, val))
+
             for var,val in jumps: state[var]=val
             for var in set(list(state.keys()) + [r[0] for r in ramps]):
                 if var not in series: series[var] = [None]*len(times)
