@@ -2,7 +2,9 @@
 # Fast MOCVD Recipe Comparator (Plotly, event-based)
 # + 산점도 피처: Peak ReactorTemp, Pre-Stabilization(없으면 Pre-loop) ReactorPress
 # + 산점도 라벨: 파일명 맨 앞 숫자(run number)만 표시
-# + NEW: 여러 레시피에서 loop 요약/상세 테이블 생성
+# + Loop 요약/상세 테이블
+# + NEW: loop_windows_seconds() — 루프 구간(start/end) 계산
+# + UPDATED: compare_memory() — 첫 run 기준 루프 밴드 오버레이 옵션
 
 import re
 from dataclasses import dataclass, field
@@ -49,7 +51,7 @@ def boolish(v: Any) -> Optional[int]:
     return None
 
 # --------------------------
-# Loop expander (문자열 전개)
+# Loop expander
 # --------------------------
 def expand_loops(text: str) -> str:
     loop_pat = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
@@ -225,54 +227,6 @@ def _parse_cached(text: str) -> Recipe:
     return parser.parse(text)
 
 # --------------------------
-# Batch compare (기존)
-# --------------------------
-def compare_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=True) -> Dict[str, "go.Figure"]:
-    runs = []
-    for name, txt in files:
-        recipe = _parse_cached(txt)
-        series_cp, total_T = build_change_points(recipe, vars)
-        runs.append({"name": name, "series_cp": series_cp, "total_T": total_T})
-
-    figs: Dict[str, go.Figure] = {}
-    for var in vars:
-        fig = go.Figure()
-        for r in runs:
-            if var not in r["series_cp"]: continue
-            pts = r["series_cp"][var]
-            if not pts: continue
-            base = pts[0][0] if align_zero else 0.0
-            xs = [t - base for (t, _) in pts]
-            ys = [v for (_, v) in pts]
-            finite = [v for v in ys if v is not None]
-            is_binary = bool(finite) and set(finite).issubset({0.0,1.0})
-            fig.add_trace(go.Scatter(
-                x=xs, y=ys, mode='lines', name=r["name"],
-                line_shape='hv' if is_binary else 'linear'
-            ))
-        fig.update_layout(
-            title=f"Compare: {var}",
-            xaxis_title="Time (s)" + (" (t0-aligned)" if align_zero else ""),
-            yaxis_title=var,
-            template="plotly_white",
-            legend_title="run"
-        )
-        figs[var] = fig
-    return figs
-
-def tidy_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=True) -> pd.DataFrame:
-    rows=[]
-    for name, txt in files:
-        recipe = _parse_cached(txt)
-        series_cp, _ = build_change_points(recipe, vars)
-        for var, pts in series_cp.items():
-            if not pts: continue
-            base = pts[0][0] if align_zero else 0.0
-            for (t, v) in pts:
-                rows.append({"run": name, "variable": var, "time_s": t - base, "value": v})
-    return pd.DataFrame(rows)
-
-# --------------------------
 # 텍스트 전처리 + loop 블록 추출
 # --------------------------
 def _preclean_text(text: str) -> str:
@@ -299,8 +253,7 @@ def _extract_loop_blocks(text: str) -> List[Dict[str, str]]:
         i, L = 0, len(seg)
         while i < L:
             m = loop_pat.search(seg, i)
-            if not m:
-                break
+            if not m: break
             count = int(m.group(1))
             j = m.end(); depth = 1
             while j < L and depth > 0:
@@ -310,22 +263,139 @@ def _extract_loop_blocks(text: str) -> List[Dict[str, str]]:
                 j += 1
             inner = seg[m.end(): j-1]
             out.append({"count": count, "block_text": inner})
-            # 중첩 loop도 따로 기록
-            out.extend(walk(inner))
+            out.extend(walk(inner))  # nested
             i = j
         return out
-
     return walk(s)
 
 # --------------------------
-# NEW: 산점도용 피처 (Peak T, Pre-Ref P: Stabilization≻Loop)
+# NEW: 루프 구간(start/end) 계산
+# --------------------------
+def loop_windows_seconds(text: str) -> List[Dict[str, float]]:
+    """
+    원본 텍스트를 선형 스캔하여 루프 start/end를 누적 시간 기준으로 산출.
+    반환: [{"start": s0, "end": s1, "count": N, "sec_per_cycle": C}, ...]
+    (상위 레벨 loop 기준; 중첩 loop는 상위에 포함됨)
+    """
+    s = _preclean_text(text)
+    loop_pat = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
+
+    def _sum_durations(seg: str) -> float:
+        if not seg.strip(): return 0.0
+        r = _parse_cached(seg)
+        return float(sum(st.dur_s for st in r.steps))
+
+    windows: List[Dict[str, float]] = []
+    i, L, cursor = 0, len(s), 0.0
+    while i < L:
+        m = loop_pat.search(s, i)
+        if not m:
+            cursor += _sum_durations(s[i:])
+            break
+        # 앞 부분(비-loop)
+        cursor += _sum_durations(s[i:m.start()])
+
+        # loop 본문 범위 찾기
+        j = m.end(); depth = 1
+        while j < L and depth > 0:
+            ch = s[j]
+            if ch == '{': depth += 1
+            elif ch == '}': depth -= 1
+            j += 1
+        inner = s[m.end(): j-1]
+        count = int(m.group(1))
+        cyc = _sum_durations(inner)
+
+        start = cursor
+        end = cursor + count * cyc
+        windows.append({"start": start, "end": end, "count": count, "sec_per_cycle": cyc})
+        cursor = end
+        i = j
+    return windows
+
+# --------------------------
+# Batch compare
+# --------------------------
+def compare_memory(
+    files: List[Tuple[str, str]],
+    vars: List[str],
+    align_zero: bool=True,
+    show_loop_band_first: bool=True
+) -> Dict[str, "go.Figure"]:
+    runs = []
+    for name, txt in files:
+        recipe = _parse_cached(txt)
+        series_cp, total_T = build_change_points(recipe, vars)
+        runs.append({"name": name, "text": txt, "series_cp": series_cp, "total_T": total_T})
+
+    figs: Dict[str, go.Figure] = {}
+    for var in vars:
+        fig = go.Figure()
+        for r in runs:
+            if var not in r["series_cp"]: continue
+            pts = r["series_cp"][var]
+            if not pts: continue
+            base = pts[0][0] if align_zero else 0.0
+            xs = [t - base for (t, _) in pts]
+            ys = [v for (_, v) in pts]
+            finite = [v for v in ys if v is not None]
+            is_binary = bool(finite) and set(finite).issubset({0.0,1.0})
+            fig.add_trace(go.Scatter(
+                x=xs, y=ys, mode='lines', name=r["name"],
+                line_shape='hv' if is_binary else 'linear'
+            ))
+
+        # 루프 밴드: 첫 번째 run 기준
+        if show_loop_band_first and runs and var in runs[0]["series_cp"]:
+            pts0 = runs[0]["series_cp"][var]
+            base0 = pts0[0][0] if (align_zero and pts0) else 0.0
+            wins = loop_windows_seconds(runs[0]["text"])
+            shapes = []
+            for w in wins:
+                x0, x1 = w["start"] - base0, w["end"] - base0
+                shapes.append(dict(
+                    type="rect", xref="x", yref="paper",
+                    x0=x0, x1=x1, y0=0, y1=1,
+                    fillcolor="rgba(255,165,0,0.12)", line=dict(width=0)
+                ))
+            curr = list(fig.layout.shapes) if fig.layout.shapes else []
+            curr.extend(shapes)
+            fig.update_layout(shapes=curr)
+
+        fig.update_layout(
+            title=f"Compare: {var}",
+            xaxis_title="Time (s)" + (" (t0-aligned)" if align_zero else ""),
+            yaxis_title=var,
+            template="plotly_white",
+            legend_title="run"
+        )
+        figs[var] = fig
+    return figs
+
+# --------------------------
+# tidy_memory (unchanged)
+# --------------------------
+def tidy_memory(files: List[Tuple[str, str]], vars: List[str], align_zero: bool=True) -> pd.DataFrame:
+    rows=[]
+    for name, txt in files:
+        recipe = _parse_cached(txt)
+        series_cp, _ = build_change_points(recipe, vars)
+        for var, pts in series_cp.items():
+            if not pts: continue
+            base = pts[0][0] if align_zero else 0.0
+            for (t, v) in pts:
+                rows.append({"run": name, "variable": var, "time_s": t - base, "value": v})
+    return pd.DataFrame(rows)
+
+# --------------------------
+# 산점도용 피처 (unchanged)
 # --------------------------
 def _first_stabilization_time(recipe: Recipe) -> Optional[float]:
     t = 0.0
     for st in recipe.steps:
         comment = (st.comment or "").lower()
         if STAB_TXT_RE.search(comment):
-            return t  # 해당 스텝 시작 시각
+            return t
         t += st.dur_s
     return None
 
@@ -371,7 +441,7 @@ def _pre_stabilization_or_loop_press(text: str) -> Optional[float]:
 def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame, "go.Figure"]:
     rows = []
     for name, txt in files:
-        run_no = extract_run_no(name)              # 숫자 라벨 추출
+        run_no = extract_run_no(name)
         x = _peak_temp_from_text(txt)
         y = _pre_stabilization_or_loop_press(txt)
         rows.append({
@@ -387,9 +457,9 @@ def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame,
         x=df["ReactorTemp_peak"],
         y=df["ReactorPress_preRef"],
         mode="markers+text",
-        text=df["run_no"].astype(str),            # 점 위 텍스트 = run number
+        text=df["run_no"].astype(str),
         textposition="top center",
-        hovertext=df["run"],                      # 호버에는 전체 파일명
+        hovertext=df["run"],
         hoverinfo="text+x+y",
         name="runs"
     ))
@@ -403,48 +473,47 @@ def scatter_features_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame,
     return df, fig
 
 # --------------------------
-# NEW: 여러 레시피의 loop 요약/상세 테이블 생성
+# Loop 요약/상세 테이블 (unchanged)
 # --------------------------
 def loops_summary_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    반환:
-      df_loops:  run, loop_id(1..), cycles, steps_per_cycle, sec_per_cycle, total_sec
-      df_steps:  run, loop_id, step_idx(1..), duration_s, comment, actions, cycles
-    """
     loops_rows, steps_rows = [], []
 
     for name, txt in files:
-        blocks = _extract_loop_blocks(txt)  # [{count, block_text}, ...]
-        if not blocks:
-            continue
-        for idx, lb in enumerate(blocks, start=1):
-            # loop 내부 1 cycle 파싱
-            recipe = _parse_cached(lb["block_text"])
+        # loop 블록 추출
+        s = _preclean_text(txt)
+        loop_pat = re.compile(r'\bloop\s+(\d+)\s*\{', re.IGNORECASE)
+        i, L = 0, len(s)
+        idx = 1
+        while i < L:
+            m = loop_pat.search(s, i)
+            if not m: break
+            j = m.end(); depth = 1
+            while j < L and depth > 0:
+                ch = s[j]
+                if ch == '{': depth += 1
+                elif ch == '}': depth -= 1
+                j += 1
+            inner = s[m.end(): j-1]
+            count = int(m.group(1))
+
+            recipe = _parse_cached(inner)
             steps = recipe.steps
-            sec_per_cycle = sum(s.dur_s for s in steps)
+            sec_per_cycle = sum(st.dur_s for st in steps)
             loops_rows.append({
-                "run": name,
-                "loop_id": idx,
-                "cycles": lb["count"],
+                "run": name, "loop_id": idx, "cycles": count,
                 "steps_per_cycle": len(steps),
                 "sec_per_cycle": sec_per_cycle,
-                "total_sec": sec_per_cycle * lb["count"],
+                "total_sec": sec_per_cycle * count
             })
-            # 상세 step 나열
-            for k, st in enumerate(steps, start=1):
-                actions_str = "; ".join(
-                    f"{a.var} {a.op} {a.raw_value}".strip()
-                    for a in st.actions
-                )
+            for k, stp in enumerate(steps, start=1):
+                actions_str = "; ".join(f"{a.var} {a.op} {a.raw_value}".strip() for a in stp.actions)
                 steps_rows.append({
-                    "run": name,
-                    "loop_id": idx,
-                    "step_idx": k,
-                    "duration_s": st.dur_s,
-                    "comment": (st.comment or ""),
-                    "actions": actions_str,
-                    "cycles": lb["count"],
+                    "run": name, "loop_id": idx, "step_idx": k,
+                    "duration_s": stp.dur_s, "comment": (stp.comment or ""),
+                    "actions": actions_str, "cycles": count
                 })
+            idx += 1
+            i = j
 
     df_loops = pd.DataFrame(loops_rows) if loops_rows else pd.DataFrame(
         columns=["run","loop_id","cycles","steps_per_cycle","sec_per_cycle","total_sec"]
@@ -453,4 +522,3 @@ def loops_summary_memory(files: List[Tuple[str, str]]) -> Tuple[pd.DataFrame, pd
         columns=["run","loop_id","step_idx","duration_s","comment","actions","cycles"]
     )
     return df_loops, df_steps
-
