@@ -4,6 +4,7 @@
 # - 배치 비교: 여러 파일 업로드 → 변수별 run 비교(Plotly, 이벤트 기반 빠른 렌더)
 # - 산점도: Peak ReactorTemp (x) vs Pre-Stabilization(없으면 Pre-loop) ReactorPress (y), 라벨=run#
 # - Loop 분석: 파일별 loop 개수/시간 요약 + 1cycle 상세(step-by-step)
+# - NEW: 2개 레시피 Diff(차이점 빨간색), #...# 로 둘러싼 단어 무시
 # - 주석(#/ // / 구분선) 무시, 마지막 세미콜론 누락 허용, '='(즉시), 'to'(선형 램프)
 
 import re
@@ -319,10 +320,63 @@ def summarize_loop_steps(block_text: str):
     return items, total_sec, len(items)
 
 # --------------------------
+# NEW: 2개 레시피 Diff 유틸
+# --------------------------
+_HASH_PAIR_RE = re.compile(r'#([^#]*?)#')
+
+def remove_hash_enclosed(text: str) -> str:
+    """#...# 로 둘러싼 구간 삭제(라인 내 어디든)."""
+    # 줄 단위로 처리하여 과도한 제거 방지
+    out = []
+    for line in text.splitlines():
+        out.append(_HASH_PAIR_RE.sub('', line))
+    return "\n".join(out)
+
+def recipe_to_step_signatures(text: str) -> List[str]:
+    """
+    텍스트 → (#...# 제거 → Parser) → 각 step을 'duration | comment | var op val, ...' 시그니처로 변환.
+    """
+    text2 = remove_hash_enclosed(text)
+    parser = Parser(tolerate_missing_semicolon=True)
+    recipe = parser.parse(text2)
+
+    sigs: List[str] = []
+    for stp in recipe.steps:
+        comment = (stp.comment or "").strip()
+        comment = _HASH_PAIR_RE.sub('', comment).strip()  # 안전하게 한 번 더
+        acts = [f"{a.var} {a.op} {a.raw_value}".strip() for a in stp.actions]
+        acts_sorted = ", ".join(sorted(acts))
+        sig = f"{stp.time_s}s | {comment} | {acts_sorted}".strip()
+        sig = re.sub(r"\s+", " ", sig)
+        sigs.append(sig)
+    return sigs
+
+def diff_dataframe(textA: str, textB: str) -> pd.DataFrame:
+    sigA = recipe_to_step_signatures(textA)
+    sigB = recipe_to_step_signatures(textB)
+    n = max(len(sigA), len(sigB))
+    rows = []
+    for i in range(n):
+        a = sigA[i] if i < len(sigA) else ""
+        b = sigB[i] if i < len(sigB) else ""
+        same = (a == b)
+        rows.append({"step": i+1, "A": a, "B": b, "same": same})
+    return pd.DataFrame(rows)
+
+def style_diff(df: pd.DataFrame):
+    def _rowstyle(row):
+        if not row["same"]:
+            return ["", "background-color:#ffe6e6; color:#b00000",
+                    "background-color:#ffe6e6; color:#b00000", ""]
+        else:
+            return ["", "", "", ""]
+    return df[["step","A","B","same"]].style.apply(_rowstyle, axis=1)
+
+# --------------------------
 # Streamlit UI
 # --------------------------
 st.set_page_config(page_title="MOCVD Recipe Visualizer", layout="wide")
-st.title("📈 MOCVD 레시피 시각화 (단일 + 배치 비교 + 산점도 + 루프 분석)")
+st.title("📈 MOCVD 레시피 시각화 (단일 + 배치 비교 + 산점도 + 루프 분석 + 2개 Diff)")
 
 with st.expander("옵션", expanded=True):
     dt = st.number_input("샘플링 간격 dt (s)", min_value=1, value=1, step=1, key="dt")
@@ -367,7 +421,7 @@ if uploaded or use_demo:
 
         with st.expander("요약", expanded=True):
             st.write(f"총 스텝(전개 후): {len(recipe.steps)} | 총 시간: {times[-1]} s")
-            if parser.loop_blocks:
+            if hasattr(parser, "loop_blocks") and parser.loop_blocks:
                 st.subheader("Loop 요약")
                 rows=[]
                 for lb in parser.loop_blocks:
@@ -379,7 +433,7 @@ if uploaded or use_demo:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
         with st.expander("루프 패턴 (1 cycle 요약)", expanded=True):
-            if parser.loop_blocks:
+            if hasattr(parser, "loop_blocks") and parser.loop_blocks:
                 for lb in parser.loop_blocks:
                     items, cycle_sec, cycle_steps = summarize_loop_steps(lb["block_text"])
                     st.markdown(f"**loop ({lb['count']})** — one cycle: {cycle_sec}s, {cycle_steps} steps")
@@ -442,7 +496,7 @@ if files:
     st.download_button("CSV 다운로드(산점도 피처)", data=df_feat.to_csv(index=False).encode("utf-8-sig"),
                        file_name="scatter_features.csv", mime="text/csv")
 
-    # ---------- NEW: Loop 분석 ----------
+    # ---------- Loop 분석 ----------
     with st.expander("🔁 Loop 분석 (요약/상세)", expanded=False):
         df_loops, df_steps = loops_summary_memory(file_tuples)
 
@@ -465,7 +519,6 @@ if files:
                     .sort_values("step_idx")
             st.dataframe(view, use_container_width=True)
 
-            # 패턴 미니 요약(한 줄)
             lines = [f"({int(r.duration_s)}s) comment='{r.comment}' | actions='{r.actions}'"
                      for r in view.itertuples()]
             st.code("\n".join(lines), language="text")
@@ -477,3 +530,28 @@ if files:
             )
         else:
             st.info("업로드한 레시피에서 loop를 찾지 못했습니다.")
+
+# ---- C) 2개 레시피 Diff
+st.markdown("---")
+st.header("🔍 2개 레시피 비교 (Diff) — 차이점은 빨간색, #...# 무시")
+
+colA, colB = st.columns(2)
+with colA:
+    fA = st.file_uploader("레시피 A (.txt)", type=["txt"], key="diffA")
+with colB:
+    fB = st.file_uploader("레시피 B (.txt)", type=["txt"], key="diffB")
+
+if fA and fB:
+    textA = fA.read().decode("utf-8", errors="ignore")
+    textB = fB.read().decode("utf-8", errors="ignore")
+
+    df_diff = diff_dataframe(textA, textB)
+    st.dataframe(style_diff(df_diff), use_container_width=True)
+
+    st.download_button(
+        "CSV 다운로드(Diff 결과)",
+        data=df_diff.to_csv(index=False).encode("utf-8-sig"),
+        file_name="diff_steps.csv", mime="text/csv"
+    )
+else:
+    st.caption("두 파일을 모두 올리면 step-by-step 비교 결과가 표시됩니다. (#...# 내용은 자동 무시)")
