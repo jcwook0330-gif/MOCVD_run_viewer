@@ -372,148 +372,149 @@ def style_diff(df: pd.DataFrame):
             return ["", "", "", ""]
     return df[["step","A","B","same"]].style.apply(_rowstyle, axis=1)
 
-# --------------------------
-# Streamlit UI
-# --------------------------
+# =========================
+# UI (탭 레이아웃) 시작
+# =========================
 st.set_page_config(page_title="MOCVD Recipe Visualizer", layout="wide")
-st.title("📈 MOCVD 레시피 시각화 (단일 + 배치 비교 + 산점도 + 루프 분석 + 2개 Diff)")
+st.title("📈 MOCVD 레시피 뷰어")
 
-with st.expander("옵션", expanded=True):
-    dt = st.number_input("샘플링 간격 dt (s)", min_value=1, value=1, step=1, key="dt")
-    absolute = st.checkbox("타임스탬프를 절대 시간으로 해석", value=False, key="abs")
-    mode = st.radio("단일 파일 플롯 모드", ["겹쳐 그리기(한 그림)", "변수별 분리"], horizontal=True, key="mode")
+# --- 사이드바: 공용 업로더(배치/산점도/루프 탭에서 공유) ---
+with st.sidebar:
+    st.subheader("📂 공용 업로드(여러 레시피)")
+    _files_shared = st.file_uploader(
+        "여러 레시피 .txt 업로드", type=["txt"], accept_multiple_files=True, key="multi_shared"
+    )
+    if _files_shared:
+        st.session_state["batch_files"] = [
+            (f.name, f.read().decode("utf-8", errors="ignore")) for f in _files_shared
+        ]
+    st.caption("여기서 업로드하면 ‘배치 비교/산점도/루프 분석’ 탭에서 그대로 재사용됩니다.")
 
-# ---- A) 단일 레시피
-uploaded = st.file_uploader("단일 레시피 업로드 (.txt)", type=["txt"])
-use_demo = st.checkbox("내장 데모 사용", value=False)
+# --- 탭 생성 ---
+tab_single, tab_batch, tab_scatter, tab_loop, tab_diff = st.tabs(
+    ["단일", "배치 비교", "산점도", "루프 분석", "Diff"]
+)
 
-if uploaded or use_demo:
-    if use_demo:
-        text = (
-            'loop 3 {\n'
-            '  0:00:02 "TEBo on / NH3 off",  TMGa_2.run = open, DummyMO1.run = close;\n'
-            '  0:00:01 "Interruption",        TMGa_2.run = close, DummyMO1.run = open;\n'
-            '  0:00:01 "TEBo off / NH3 on",   NH3_1.run = open, RunHydride = 800, PushHydride = 1000;\n'
-            '  0:00:01 "Interruption",        NH3_1.run = close, RunHydride = 5000, PushHydride = 5000;\n'
-            '}\n'
-            '0:00:01 "End growth", TMGa_2.run = close, TMGa_2.line = close, DummyMO1.run = open,\n'
-            '                      NH3_1.run = open;\n'
-        )
-    else:
-        text = uploaded.read().decode("utf-8", errors="ignore")
+# ============== 탭 1: 단일 ==============
+with tab_single:
+    st.subheader("단일 레시피 시각화")
+    dt = st.number_input("샘플링 간격 dt (s)", min_value=1, value=1, step=1, key="dt_single")
+    absolute = st.checkbox("타임스탬프를 절대 시간으로 해석", value=False, key="abs_single")
+    mode = st.radio("플롯 모드", ["겹쳐 그리기(한 그림)", "변수별 분리"], horizontal=True, key="mode_single")
 
-    parser = Parser(tolerate_missing_semicolon=True)
-    recipe = parser.parse(text)
-    times, series, windows = Timeline(dt=dt, absolute=absolute).build(recipe)
+    uploaded_single = st.file_uploader("단일 레시피(.txt)", type=["txt"], key="single_up")
+    use_demo = st.checkbox("내장 데모 사용", value=False, key="demo_single")
 
-    if not series:
-        st.warning("파싱 가능한 명령이 없습니다.")
-    else:
-        vars_all = list_variables(series)
-        default_pick = [v for v in ["CeilingTemp","ReactorTemp","ReactorPress","RF_U",
-                                    "NH3_1.source","NH3_1.run","TMGa_2.run","DummyMO1.run"]
+    if uploaded_single or use_demo:
+        if use_demo:
+            text = (
+                'loop 3 {\n'
+                '  0:00:02 "TEBo on / NH3 off",  TMGa_2.run = open, DummyMO1.run = close;\n'
+                '  0:00:01 "Interruption",        TMGa_2.run = close, DummyMO1.run = open;\n'
+                '  0:00:01 "TEBo off / NH3 on",   NH3_1.run = open, RunHydride = 800, PushHydride = 1000;\n'
+                '  0:00:01 "Interruption",        NH3_1.run = close, RunHydride = 5000, PushHydride = 5000;\n'
+                '}\n'
+                '0:00:01 "End growth", TMGa_2.run = close, TMGa_2.line = close, DummyMO1.run = open,\n'
+                '                      NH3_1.run = open;\n'
+            )
+        else:
+            text = uploaded_single.read().decode("utf-8", errors="ignore")
+
+        parser = Parser(tolerate_missing_semicolon=True)
+        recipe = parser.parse(text)
+        times, series, windows = Timeline(dt=dt, absolute=absolute).build(recipe)
+
+        if series:
+            vars_all = sorted(series.keys())
+            defaults = [v for v in ["CeilingTemp", "ReactorTemp", "ReactorPress", "RF_U",
+                                    "NH3_1.source", "NH3_1.run", "TMGa_2.run", "DummyMO1.run"]
                         if v in vars_all][:3]
-        picked = st.multiselect("시각화할 변수 선택", vars_all, default=default_pick, key="single_vars")
+            picked = st.multiselect("시각화할 변수", vars_all, default=defaults, key="single_vars")
+            df_single = pd.DataFrame({"time_s": times, **{k: series[k] for k in vars_all}})
+            st.download_button("CSV 다운로드(단일)", df_single.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="timeline_single.csv", mime="text/csv")
 
-        df_single = pd.DataFrame({"time_s": times, **{k: series[k] for k in vars_all}})
-        st.download_button("CSV 다운로드(단일)", data=df_single.to_csv(index=False).encode("utf-8-sig"),
-                           file_name="timeline_single.csv", mime="text/csv")
-
-        with st.expander("요약", expanded=True):
-            st.write(f"총 스텝(전개 후): {len(recipe.steps)} | 총 시간: {times[-1]} s")
-            if hasattr(parser, "loop_blocks") and parser.loop_blocks:
-                st.subheader("Loop 요약")
+            # Loop 요약
+            if getattr(parser, "loop_blocks", None):
+                st.markdown("**Loop 요약**")
                 rows=[]
                 for lb in parser.loop_blocks:
                     tmp_p = Parser(True); tmp_r = tmp_p.parse(lb["block_text"])
-                    cycle_steps = len(tmp_r.steps); cycle_dur = sum(s.time_s for s in tmp_r.steps)
+                    cyc_steps = len(tmp_r.steps); cyc_sec = sum(s.time_s for s in tmp_r.steps)
                     rows.append({"Loop ID": lb["id"], "Cycles": lb["count"],
-                                 "Steps / cycle": cycle_steps, "Sec / cycle": cycle_dur,
-                                 "Total sec": cycle_dur * lb["count"]})
+                                 "Steps/cycle": cyc_steps, "Sec/cycle": cyc_sec,
+                                 "Total sec": cyc_sec * lb["count"]})
                 st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
-        with st.expander("루프 패턴 (1 cycle 요약)", expanded=True):
-            if hasattr(parser, "loop_blocks") and parser.loop_blocks:
-                for lb in parser.loop_blocks:
-                    items, cycle_sec, cycle_steps = summarize_loop_steps(lb["block_text"])
-                    st.markdown(f"**loop ({lb['count']})** — one cycle: {cycle_sec}s, {cycle_steps} steps")
-                    lines = [f"({dur}s) comment = '{com}'" for dur, com in items]
-                    st.code("\n".join(lines), language="text")
-                    st.markdown("---")
-            else:
-                st.info("요약할 loop가 없습니다.")
+            # 플롯
+            if picked:
+                if mode.startswith("겹쳐"):
+                    plot_overlay(times, series, picked)
+                else:
+                    plot_separate(times, series, picked)
+        else:
+            st.info("파싱 가능한 데이터가 없습니다.")
 
-        with st.expander("전체 스텝 로그 (상세)", expanded=False):
-            preview_n = st.slider("미리보기 개수", 10, 200, 50, step=10, key="preview_n_single")
-            for i,(t0,t1,stp) in enumerate(windows[:preview_n],1):
-                st.text(f"[{i:02d}] {t0:>5}s → {t1:>5}s ({t1-t0:>3}s)  comment='{stp.comment or ''}'")
-            if len(windows) > preview_n:
-                st.text(f"... (총 {len(windows)}개 중 {preview_n}개 표시)")
+# ============== 탭 2: 배치 비교 ==============
+with tab_batch:
+    st.subheader("여러 레시피 비교")
+    file_tuples = st.session_state.get("batch_files", None)
+    if not file_tuples:
+        st.info("사이드바에서 여러 레시피를 업로드하세요.")
+    else:
+        # 변수 후보(첫 파일 기준)
+        try:
+            p0 = Parser(True); r0 = p0.parse(file_tuples[0][1])
+            _, s0, _ = Timeline(dt=1, absolute=False).build(r0)
+            all_vars = sorted(s0.keys())
+        except Exception:
+            all_vars = []
 
-        if picked:
-            if mode.startswith("겹쳐"):
-                plot_overlay(times, series, picked)
-            else:
-                plot_separate(times, series, picked)
+        defaults = [v for v in ["CeilingTemp", "ReactorTemp", "ReactorPress", "RF_U", "NH3_1.source"] if v in all_vars] or all_vars[:3]
+        vars_to_compare = st.multiselect("비교 변수", all_vars, default=defaults, key="cmp_vars_tab")
+        align_zero = st.checkbox("t=0 정렬", value=True, key="align0_tab")
 
-# ---- B) 배치 비교
-st.markdown("---")
-st.header("🧪 배치 비교 (여러 레시피 업로드)")
+        if vars_to_compare:
+            figs = compare_memory(file_tuples, vars=vars_to_compare, align_zero=align_zero)
+            for var, fig in figs.items():
+                st.plotly_chart(fig, use_container_width=True)
 
-files = st.file_uploader("여러 레시피 업로드 (.txt)", type=["txt"], accept_multiple_files=True, key="multi_up")
-if files:
-    file_tuples = [(f.name, f.read().decode("utf-8", errors="ignore")) for f in files]
+            df_tidy = tidy_memory(file_tuples, vars=vars_to_compare, align_zero=align_zero)
+            st.download_button("CSV 다운로드(배치 tidy)", df_tidy.to_csv(index=False).encode("utf-8-sig"),
+                               file_name="batch_tidy.csv", mime="text/csv")
 
-    # 변수 후보(간단히 첫 파일 기준)
-    all_vars = set()
-    try:
-        p0 = Parser(True); r0 = p0.parse(file_tuples[0][1])
-        _, s0, _ = Timeline(dt=1, absolute=False).build(r0)
-        all_vars.update(s0.keys())
-    except Exception:
-        pass
+# ============== 탭 3: 산점도 ==============
+with tab_scatter:
+    st.subheader("Peak ReactorTemp vs Pre-Ref ReactorPress (라벨=run#)")
+    file_tuples = st.session_state.get("batch_files", None)
+    if not file_tuples:
+        st.info("사이드바에서 여러 레시피를 업로드하세요.")
+    else:
+        df_feat, fig_scatter = scatter_features_memory(file_tuples)
+        st.plotly_chart(fig_scatter, use_container_width=True)
+        st.dataframe(df_feat, use_container_width=True)
+        st.download_button("CSV 다운로드(산점도 피처)", df_feat.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="scatter_features.csv", mime="text/csv")
 
-    all_vars = sorted(all_vars) if all_vars else []
-    default_vars = [v for v in ["CeilingTemp","ReactorTemp","ReactorPress","RF_U","NH3_1.source"] if v in all_vars] or all_vars[:3]
-    vars_to_compare = st.multiselect("비교할 변수 선택", all_vars, default=default_vars, key="cmp_vars")
-
-    align_zero = st.checkbox("각 run을 t=0으로 정렬(권장)", value=True, key="align0")
-
-    if vars_to_compare:
-        figs = compare_memory(file_tuples, vars=vars_to_compare, align_zero=align_zero)
-        for var, fig in figs.items():
-            st.plotly_chart(fig, use_container_width=True)
-
-        df_tidy = tidy_memory(file_tuples, vars=vars_to_compare, align_zero=align_zero)
-        st.download_button("CSV 다운로드(배치 tidy)", data=df_tidy.to_csv(index=False).encode("utf-8-sig"),
-                           file_name="batch_tidy.csv", mime="text/csv")
-
-    # 산점도: Peak T vs Pre-Ref P  (라벨=run number)
-    st.subheader("📍 분산도: Peak ReactorTemp  vs  Pre-Ref ReactorPress (라벨=run#)")
-    df_feat, fig_scatter = scatter_features_memory(file_tuples)
-    st.plotly_chart(fig_scatter, use_container_width=True)
-    st.dataframe(df_feat, use_container_width=True)
-    st.download_button("CSV 다운로드(산점도 피처)", data=df_feat.to_csv(index=False).encode("utf-8-sig"),
-                       file_name="scatter_features.csv", mime="text/csv")
-
-    # ---------- Loop 분석 ----------
-    with st.expander("🔁 Loop 분석 (요약/상세)", expanded=False):
+# ============== 탭 4: 루프 분석 ==============
+with tab_loop:
+    st.subheader("Loop 분석")
+    file_tuples = st.session_state.get("batch_files", None)
+    if not file_tuples:
+        st.info("사이드바에서 여러 레시피를 업로드하세요.")
+    else:
         df_loops, df_steps = loops_summary_memory(file_tuples)
-
         st.markdown("**요약표 (파일별 loop)**")
         st.dataframe(df_loops, use_container_width=True)
-        st.download_button(
-            "CSV 다운로드(Loop 요약)",
-            data=df_loops.to_csv(index=False).encode("utf-8-sig"),
-            file_name="loops_summary.csv", mime="text/csv"
-        )
+        st.download_button("CSV 다운로드(Loop 요약)", df_loops.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="loops_summary.csv", mime="text/csv")
 
         st.markdown("**상세표 (1 cycle step-by-step)**")
         if not df_steps.empty:
             runs = sorted(df_steps["run"].unique().tolist())
-            pick_run = st.selectbox("Run 선택", runs, index=0, key="loop_run")
+            pick_run = st.selectbox("Run 선택", runs, index=0, key="loop_run_tab")
             loops_in_run = sorted(df_steps[df_steps["run"]==pick_run]["loop_id"].unique().tolist())
-            pick_loop = st.selectbox("Loop 선택", loops_in_run, index=0, key="loop_id")
+            pick_loop = st.selectbox("Loop 선택", loops_in_run, index=0, key="loop_id_tab")
 
             view = df_steps[(df_steps["run"]==pick_run) & (df_steps["loop_id"]==pick_loop)] \
                     .sort_values("step_idx")
@@ -523,35 +524,32 @@ if files:
                      for r in view.itertuples()]
             st.code("\n".join(lines), language="text")
 
-            st.download_button(
-                "CSV 다운로드(Loop 상세-선택)",
-                data=view.to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"loop_steps_{pick_loop}.csv", mime="text/csv"
-            )
+            st.download_button("CSV 다운로드(Loop 상세-선택)",
+                               view.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"loop_steps_{pick_loop}.csv", mime="text/csv")
         else:
             st.info("업로드한 레시피에서 loop를 찾지 못했습니다.")
 
-# ---- C) 2개 레시피 Diff
-st.markdown("---")
-st.header("🔍 2개 레시피 비교 (Diff) — 차이점은 빨간색, #...# 무시")
+# ============== 탭 5: Diff ==============
+with tab_diff:
+    st.subheader("두 개 레시피 Diff — 차이점은 빨간색, #...# 무시")
+    colA, colB = st.columns(2)
+    with colA:
+        fA = st.file_uploader("레시피 A (.txt)", type=["txt"], key="diffA_tab")
+    with colB:
+        fB = st.file_uploader("레시피 B (.txt)", type=["txt"], key="diffB_tab")
 
-colA, colB = st.columns(2)
-with colA:
-    fA = st.file_uploader("레시피 A (.txt)", type=["txt"], key="diffA")
-with colB:
-    fB = st.file_uploader("레시피 B (.txt)", type=["txt"], key="diffB")
+    if fA and fB:
+        textA = fA.read().decode("utf-8", errors="ignore")
+        textB = fB.read().decode("utf-8", errors="ignore")
+        df_diff = diff_dataframe(textA, textB)   # 기존에 정의해 둔 diff 유틸 사용
+        st.dataframe(style_diff(df_diff), use_container_width=True)
+        st.download_button("CSV 다운로드(Diff 결과)",
+                           df_diff.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="diff_steps.csv", mime="text/csv")
+    else:
+        st.caption("두 파일을 모두 올리면 비교 결과가 표시됩니다.")
+# =========================
+# UI (탭 레이아웃) 끝
+# =========================
 
-if fA and fB:
-    textA = fA.read().decode("utf-8", errors="ignore")
-    textB = fB.read().decode("utf-8", errors="ignore")
-
-    df_diff = diff_dataframe(textA, textB)
-    st.dataframe(style_diff(df_diff), use_container_width=True)
-
-    st.download_button(
-        "CSV 다운로드(Diff 결과)",
-        data=df_diff.to_csv(index=False).encode("utf-8-sig"),
-        file_name="diff_steps.csv", mime="text/csv"
-    )
-else:
-    st.caption("두 파일을 모두 올리면 step-by-step 비교 결과가 표시됩니다. (#...# 내용은 자동 무시)")
